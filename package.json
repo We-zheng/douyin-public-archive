@@ -1,0 +1,15 @@
+{
+  "name": "douyin-public-archive",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "archive": "node src/index.js archive",
+    "profile": "node src/index.js profile",
+    "web": "node src/web-server.js"
+  },
+  "dependencies": {
+    "playwright": "^1.55.0"
+  }
+}
