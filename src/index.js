@@ -39,7 +39,15 @@ function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 function sleepRand(min, max) { return sleep(rand(min, max)); }
 
 function safePart(value, fallback = '未命名', len = 80) {
-  return String(value || fallback).replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').replace(/\s+/g, ' ').trim().slice(0, len) || fallback;
+  let part = String(value || fallback)
+    .replace(/[<>:"/\\|?*\x00-\x1f]/g, '_')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/[ .]+$/g, '')
+    .slice(0, len)
+    .replace(/[ .]+$/g, '');
+  if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(part)) part = `_${part}`;
+  return part || fallback;
 }
 function datePart(value) {
   const match = String(value || '').match(/(\d{4})[-/.年](\d{1,2})[-/.月](\d{1,2})/);
@@ -110,8 +118,11 @@ async function loadCompletedArchives() {
       if (!isLegacy && !isRecord) continue;
       try {
         const data = JSON.parse(await fs.readFile(path.join(OUTPUT, file), 'utf8'));
-        if (data.author) authorCounts.set(data.author, (authorCounts.get(data.author) || 0) + 1);
-        if (data.url && Array.isArray(data.media) && data.media.length && data.media.every(item => item.ok)) completedUrls.add(data.url);
+        const complete = data.complete === true || (
+          data.complete !== false && Array.isArray(data.media) && data.media.length > 0 && data.media.every(item => item.ok)
+        );
+        if (complete && data.author) authorCounts.set(data.author, (authorCounts.get(data.author) || 0) + 1);
+        if (complete && data.url) completedUrls.add(data.url);
       } catch { /* 忽略手工修改或未完成的记录 */ }
     }
   } catch { /* 首次运行没有历史记录 */ }
@@ -133,25 +144,28 @@ async function readVisiblePost(page, url) {
     if (/^video\//i.test(contentType) || /\/aweme\/v\d+\/play|\/playwm|mime_type=video/i.test(responseUrl)) playedVideos.add(responseUrl);
   };
   page.on('response', onResponse);
-  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-  await sleepRand(500, 1000); // 模拟真人打开后先看一看
-  // 仅触发页面已有播放器的正常播放，让浏览器请求公开视频资源；不构造或破解媒体地址。
-  await page.locator('video').evaluateAll(videos => videos.forEach(video => video.play().catch(() => {}))).catch(() => {});
-  await sleepRand(1500, 2500); // 继续停留观看，单个作品页面总计约 2-4 秒
-  const data = await page.evaluate(() => {
-    const val = (selector, attr = 'content') => document.querySelector(selector)?.getAttribute(attr)?.trim() || '';
-    const text = document.body?.innerText?.replace(/\n{3,}/g, '\n\n').trim() || '';
-    const images = [...document.images].map(x => x.currentSrc || x.src).filter(Boolean);
-    const videos = [...document.querySelectorAll('video')].flatMap(v => [v.currentSrc, v.src, ...[...v.querySelectorAll('source')].map(s => s.src)]).filter(Boolean);
-    const resources = performance.getEntriesByType('resource').map(x => x.name).filter(x => /^https?:/i.test(x));
-    const canonical = val('link[rel="canonical"]', 'href') || location.href;
-    return {
-      title: val('meta[property="og:title"]') || document.title,
-      description: val('meta[property="og:description"]') || val('meta[name="description"]'),
-      author: val('meta[name="author"]') || '', canonical, pageText: text.slice(0, 12000), images, videos, resources
-    };
-  });
-  page.off('response', onResponse);
+  let data;
+  try {
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await sleepRand(500, 1000);
+    await page.locator('video').evaluateAll(videos => videos.forEach(video => video.play().catch(() => {}))).catch(() => {});
+    await sleepRand(1500, 2500);
+    data = await page.evaluate(() => {
+      const val = (selector, attr = 'content') => document.querySelector(selector)?.getAttribute(attr)?.trim() || '';
+      const text = document.body?.innerText?.replace(/\n{3,}/g, '\n\n').trim() || '';
+      const images = [...document.images].map(x => x.currentSrc || x.src).filter(Boolean);
+      const videos = [...document.querySelectorAll('video')].flatMap(v => [v.currentSrc, v.src, ...[...v.querySelectorAll('source')].map(s => s.src)]).filter(Boolean);
+      const resources = performance.getEntriesByType('resource').map(x => x.name).filter(x => /^https?:/i.test(x));
+      const canonical = val('link[rel="canonical"]', 'href') || location.href;
+      return {
+        title: val('meta[property="og:title"]') || document.title,
+        description: val('meta[property="og:description"]') || val('meta[name="description"]'),
+        author: val('meta[name="author"]') || '', canonical, pageText: text.slice(0, 12000), images, videos, resources
+      };
+    });
+  } finally {
+    page.off('response', onResponse);
+  }
   const imageUrls = unique([...data.images, ...data.resources]).filter(url =>
     IMAGE_EXT.test(url) && isPublicContentMedia(url) && /biz_tag=aweme_images|s=PackSourceEnum_AWEME_DETAIL|aweme_images/i.test(url)
   );
@@ -160,24 +174,23 @@ async function readVisiblePost(page, url) {
   );
   return { ...data, media: [...videoUrls.map(url => ({ url, kind: 'video' })), ...imageUrls.map(url => ({ url, kind: 'image' }))] };
 }
-
 async function appendCsv(dir, item) {
   const file = path.join(dir, '作品清单.csv');
   const header = '采集时间,作者,标题,作品链接,文件名\n';
   const quote = v => `"${String(v ?? '').replaceAll('"', '""').replaceAll('\n', ' ')}"`;
-  try { await fs.access(file); } catch { await fs.writeFile(file, '\ufeff' + header, 'utf8'); }
+  try {
+    const existing = await fs.readFile(file, 'utf8');
+    if (existing.includes(quote(item.url))) return;
+  } catch {
+    await fs.writeFile(file, '\ufeff' + header, 'utf8');
+  }
   await fs.appendFile(file, [item.archivedAt, item.author, item.title, item.url, item.file].map(quote).join(',') + '\n', 'utf8');
 }
-
-// 归档单个作品；checkAuthor 为 true 时校验作者，非目标博主返回 foreign。
-async function archiveOne(page, url, { checkAuthor = false } = {}) {
+// 归档单个作品；inspectOnly 只校验目标作者，不写文件。
+async function archiveOne(page, url, { checkAuthor = false, inspectOnly = false } = {}) {
   const data = await readVisiblePost(page, url);
   if (new URL(data.canonical).pathname.startsWith('/user/')) {
     throw new Error('该链接跳转到了博主主页，请使用 profile 命令归档其公开作品。');
-  }
-  if (completedUrls.has(data.canonical)) {
-    console.log(`跳过已完成：${data.title}`);
-    return { status: 'skipped' };
   }
   const { author: rawAuthor, publishedAt, publishedDate } = postDetails(data);
   if (!rawAuthor) throw new Error(`无法从作品页识别作者，未归档：${data.canonical}`);
@@ -185,21 +198,24 @@ async function archiveOne(page, url, { checkAuthor = false } = {}) {
   if (checkAuthor && (!activeProfileAuthor || !sameAuthor(rawAuthor, activeProfileAuthor))) {
     return { status: 'foreign', author: rawAuthor, title: data.title };
   }
+  if (inspectOnly) return { status: 'target', author: rawAuthor, title: data.title };
+  if (completedUrls.has(data.canonical)) {
+    console.log(`跳过已完成：${data.title}`);
+    return { status: 'skipped', author: rawAuthor };
+  }
   const id = (data.canonical.match(/(?:video|note)\/(\d+)/)?.[1]) || crypto.createHash('sha1').update(data.canonical).digest('hex').slice(0, 12);
   const author = safePart(rawAuthor);
   const authorDir = path.join(OUTPUT, author);
   const recordDir = path.join(authorDir, RECORD_DIRNAME);
   await ensure(recordDir);
-  // 扁平化命名：发布日期_标题_作品ID，直接放在博主文件夹下，不再建作品子文件夹。
   const base = `${publishedDate}_${safePart(data.title, '作品', 50)}_${id}`;
   const videos = data.media.filter(m => m.kind === 'video');
-  const images = data.media.filter(m => m.kind === 'image');
+  const images = videos.length ? [] : data.media.filter(m => m.kind === 'image');
   const downloads = [];
-  // 页面常会暴露同一视频的多个清晰度/节点；拿到第一个可用文件便停止，避免重复下载。
   let lastVideoFailure;
   for (const media of videos) {
     const name = `${base}${extFrom(media.url, '.mp4')}`;
-    const result = { url: media.url, ...await download(page.context().request, media.url, path.join(authorDir, name)) };
+    const result = { kind: 'video', url: media.url, ...await download(page.context().request, media.url, path.join(authorDir, name)) };
     if (result.ok) { downloads.push(result); break; }
     lastVideoFailure = result;
   }
@@ -208,22 +224,23 @@ async function archiveOne(page, url, { checkAuthor = false } = {}) {
   for (const media of images) {
     index += 1;
     const name = images.length === 1 ? `${base}${extFrom(media.url, '.jpg')}` : `${base}_${String(index).padStart(2, '0')}${extFrom(media.url, '.jpg')}`;
-    downloads.push({ url: media.url, ...await download(page.context().request, media.url, path.join(authorDir, name)) });
+    downloads.push({ kind: 'image', url: media.url, ...await download(page.context().request, media.url, path.join(authorDir, name)) });
     await sleepRand(150, 350);
   }
-  const metadata = { archivedAt: new Date().toISOString(), publishedAt, publishedDate, author: rawAuthor, title: data.title, description: data.description, url: data.canonical, file: base, media: downloads };
+  const videoComplete = videos.length > 0 && downloads.some(item => item.kind === 'video' && item.ok);
+  const imagesComplete = videos.length === 0 && images.length > 0 && downloads.filter(item => item.kind === 'image').length === images.length && downloads.every(item => item.ok);
+  const complete = videoComplete || imagesComplete;
+  const metadata = { archivedAt: new Date().toISOString(), publishedAt, publishedDate, author: rawAuthor, title: data.title, description: data.description, url: data.canonical, file: base, complete, media: downloads };
   await saveJson(path.join(recordDir, `${id}.json`), metadata);
+  if (!complete) throw new Error(`没有完整保存作品媒体（成功 ${downloads.filter(x => x.ok).length}/${downloads.length}）`);
   await appendCsv(authorDir, metadata);
-  if (downloads.length && downloads.every(item => item.ok)) {
-    completedUrls.add(data.canonical);
-    authorCounts.set(rawAuthor, (authorCounts.get(rawAuthor) || 0) + 1);
-  }
+  completedUrls.add(data.canonical);
+  authorCounts.set(rawAuthor, (authorCounts.get(rawAuthor) || 0) + 1);
   console.log(`完成：${base}（成功 ${downloads.filter(x => x.ok).length}/${downloads.length} 个媒体）`);
-  return { status: 'done' };
+  return { status: 'done', author: rawAuthor };
 }
-
 // 滚动收集主页作品链接。need = 起始位置 + 本批数量，收集够了就停；
-// 连续 3 次滚动没有新作品则判定到底/被断供，立即停止（防风控也防抓推荐流）。
+// 懒加载可能多次滚动后才响应；只在较长时间无新增后才判定到底。
 async function profileUrls(page, profileUrl, need) {
   await page.goto(profileUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
   console.log('已打开主页；如需登录或验证码，请在浏览器窗口完成。正在加载公开作品…');
@@ -241,7 +258,7 @@ async function profileUrls(page, profileUrl, need) {
   const found = new Set();
   let stagnant = 0;
   let nextRest = rand(8, 12);
-  for (let i = 0; i < 200 && found.size < need; i++) {
+  for (let i = 0; i < 600 && found.size < need; i++) {
     const before = found.size;
     try {
       const links = await page.locator('a[href*="/video/"],a[href*="/note/"]').evaluateAll(els => els.map(a => a.href));
@@ -253,15 +270,19 @@ async function profileUrls(page, profileUrl, need) {
       await page.waitForTimeout(1000);
       continue;
     }
-    if (found.size > before) { stagnant = 0; } else {
+    if (found.size > before) {
+      stagnant = 0;
+    } else {
       stagnant += 1;
-      if (stagnant >= 3) {
-        console.log(`连续 ${stagnant} 次滚动没有加载出新作品，判定已到作品末尾或触发平台限制，停止收集（共收集到 ${found.size} 条）。`);
+      console.log(`第 ${stagnant} 次滚动未加载新作品，继续等待主页懒加载…`);
+      if (stagnant >= 12) {
+        console.log(`连续 ${stagnant} 次滚动仍无新增，判定已到公开作品末尾（共收集到 ${found.size} 条候选链接）。`);
         break;
       }
     }
-    await page.mouse.wheel(0, rand(1000, 1800));
-    await sleepRand(900, 1600);
+    await page.mouse.wheel(0, stagnant ? rand(2200, 3600) : rand(1400, 2400));
+    await page.evaluate(() => window.scrollBy(0, Math.floor(window.innerHeight * 0.9))).catch(() => {});
+    await sleepRand(stagnant ? 2500 : 1200, stagnant ? 3500 : 2000);
     if (i + 1 >= nextRest) {
       const rest = rand(3, 6);
       console.log(`已滚动 ${i + 1} 屏，休息 ${rest} 秒再继续…`);
@@ -275,65 +296,105 @@ async function profileUrls(page, profileUrl, need) {
 async function runProfileBatch(page, profileUrl, start, max) {
   const profileKey = normalizeProfileUrl(profileUrl);
   let job = await loadResumeJob(profileUrl);
+  const hasReliableCheckpoint = job
+    && Number.isInteger(job.nextIndex)
+    && Number.isInteger(job.targetSeen)
+    && Number.isInteger(job.verifiedCount)
+    && Number.isInteger(job.requestedStart)
+    && Number.isInteger(job.requestedMax);
+  if (job && !hasReliableCheckpoint) {
+    console.log('发现旧版断点记录；为避免从错误位置续跑，将重新扫描主页。已完成作品仍会自动跳过，不会重复下载。');
+    await clearResumeJob();
+    job = null;
+  }
+
   let urls;
   let firstIndex;
-  if (job && job.nextIndex < job.urls.length) {
+  if (job && job.nextIndex < job.urls.length && job.verifiedCount < job.requestedMax) {
     activeProfileAuthor = job.author;
     urls = job.urls;
     firstIndex = job.nextIndex;
-    console.log(`发现未完成任务：${activeProfileAuthor}，从第 ${firstIndex + 1} 个候选链接继续。`);
+    start = job.requestedStart;
+    max = job.requestedMax;
+    console.log(`发现未完成任务：${activeProfileAuthor}，已确认目标作品 ${job.verifiedCount}/${max} 个，从第 ${firstIndex + 1} 个候选链接继续。`);
   } else {
-    // 主页会混入推荐链接；先收集更大的候选池，再用作者校验筛出目标作品。
-    const need = Math.min(800, Math.max(start - 1 + max, (start - 1 + max) * 4));
+    if (job) await clearResumeJob();
+    const targetEnd = start - 1 + max;
+    const need = Math.min(3000, Math.max(targetEnd, targetEnd * 4));
     urls = await profileUrls(page, profileUrl, need);
     console.log(`共收集到 ${urls.length} 条候选链接。`);
-    if (urls.length < start) {
-      console.log(`只加载出 ${urls.length} 条候选链接，不够起始位置第 ${start} 个。`);
+    if (!urls.length) {
+      console.log('主页没有收集到可验证的作品链接。');
       return;
     }
-    job = { projectRoot: ROOT, profileUrl: profileKey, author: activeProfileAuthor, urls, nextIndex: start - 1 };
+    job = {
+      projectRoot: ROOT,
+      profileUrl: profileKey,
+      author: activeProfileAuthor,
+      urls,
+      nextIndex: 0,
+      targetSeen: 0,
+      verifiedCount: 0,
+      requestedStart: start,
+      requestedMax: max
+    };
     await saveResumeJob(job);
-    firstIndex = job.nextIndex;
+    firstIndex = 0;
   }
-  console.log(`开始扫描第 ${firstIndex + 1} 个候选链接，目标归档 ${max} 个已确认属于 ${activeProfileAuthor} 的作品。`);
-  let done = 0, skipped = 0, failed = 0, verified = 0;
-  for (let i = firstIndex; i < urls.length && verified < max; i++) {
+
+  console.log(`开始扫描第 ${firstIndex + 1} 个候选链接；目标是从该博主第 ${start} 个作品起，完成 ${max} 个。`);
+  let done = 0, skipped = 0, failed = 0;
+  for (let i = firstIndex; i < urls.length && job.verifiedCount < max; i++) {
     const seq = i + 1;
+    const inspectOnly = job.targetSeen < start - 1;
     let result;
     try {
-      result = await archiveOne(page, urls[i], { checkAuthor: true });
+      result = await archiveOne(page, urls[i], { checkAuthor: true, inspectOnly });
     } catch (error) {
       if (/Target page, context or browser has been closed/i.test(error.message)) throw error;
-      console.log(`第 ${seq} 个归档失败：${error.message}；等待后重试一次。`);
+      console.log(`第 ${seq} 个候选链接处理失败：${error.message}；等待后重试一次。`);
       await sleepRand(1000, 1800);
       try {
-        result = await archiveOne(page, urls[i], { checkAuthor: true });
+        result = await archiveOne(page, urls[i], { checkAuthor: true, inspectOnly });
       } catch (retryError) {
         if (/Target page, context or browser has been closed/i.test(retryError.message)) throw retryError;
         failed += 1;
-        skipped += 1;
-        console.log(`第 ${seq} 个仍无法确认，已跳过该条并继续：${retryError.message}`);
+        console.log(`第 ${seq} 个仍无法确认，已保留为失败并继续：${retryError.message}`);
         job = { ...job, nextIndex: i + 1 };
         await saveResumeJob(job);
         continue;
       }
     }
+
     if (result?.status === 'foreign') {
       skipped += 1;
       console.log(`第 ${seq} 个不是目标博主的作品（作者：${result.author || '无法识别'}），已跳过并继续扫描。`);
+    } else if (result?.status === 'target') {
+      job.targetSeen += 1;
+      console.log(`已确认目标博主第 ${job.targetSeen} 个作品（尚未到设置的起始位置 ${start}）。`);
     } else if (result?.status === 'skipped') {
+      job.targetSeen += 1;
+      job.verifiedCount += 1;
       skipped += 1;
-      verified += 1;
-    } else {
+    } else if (result?.status === 'done') {
+      job.targetSeen += 1;
+      job.verifiedCount += 1;
       done += 1;
-      verified += 1;
     }
+
     job = { ...job, nextIndex: i + 1 };
     await saveResumeJob(job);
-    if (i < urls.length - 1 && verified < max) await sleepRand(1500, 3000);
+    if (i < urls.length - 1 && job.verifiedCount < max) await sleepRand(1500, 3000);
   }
-  console.log(`本批结束：已确认目标作品 ${verified}/${max} 个；新归档 ${done} 个，跳过 ${skipped} 个，失败 ${failed} 个。`);
-  if (job.nextIndex >= urls.length) await clearResumeJob();
+
+  console.log(`本批结束：已确认并处理目标作品 ${job.verifiedCount}/${max} 个；新归档 ${done} 个，跳过 ${skipped} 个，失败 ${failed} 个。`);
+  if (job.verifiedCount >= max) {
+    await clearResumeJob();
+    console.log('本次目标数量已完成，断点已清除。');
+  } else if (job.nextIndex >= urls.length) {
+    await clearResumeJob();
+    console.log('本轮候选链接已扫描完但数量不足；下次会重新加载主页，并自动跳过已经完成的作品。');
+  }
 }
 async function main() {
   const command = process.argv[2];
